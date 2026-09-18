@@ -25,14 +25,33 @@ NAME="core-audio-tester"
 STAGE_DIR="dist/${NAME}-${VERSION}-macos-universal"
 TARBALL="dist/${NAME}-${VERSION}-macos-universal.tar.gz"
 
-echo "==> Building universal release binary (arm64 + x86_64)"
-swift build -c release --arch arm64 --arch x86_64
+# Each slice is built in its own scratch path and lipo'd together afterwards, rather than
+# via `swift build --arch arm64 --arch x86_64`. Passing both architectures to a single
+# invocation routes through the Xcode build system and fails with "Unexpected duplicate
+# tasks" / "missing target configuration" on Swift 6.1.x (what the macOS CI runners ship),
+# even though it works on newer toolchains. Building one arch at a time works everywhere.
+build_slice() {
+    local arch="$1"
+    local scratch=".build/universal-${arch}"
+    echo "==> Building release slice for ${arch}" >&2
+    swift build -c release --arch "$arch" --scratch-path "$scratch" >&2
+    echo "$(swift build -c release --arch "$arch" --scratch-path "$scratch" --show-bin-path)/${NAME}"
+}
 
-BIN_PATH="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/${NAME}"
-if [[ ! -f "$BIN_PATH" ]]; then
-    echo "error: built binary not found at $BIN_PATH" >&2
-    exit 1
-fi
+ARM64_BIN="$(build_slice arm64)"
+X86_64_BIN="$(build_slice x86_64)"
+
+for slice in "$ARM64_BIN" "$X86_64_BIN"; do
+    if [[ ! -f "$slice" ]]; then
+        echo "error: built binary not found at $slice" >&2
+        exit 1
+    fi
+done
+
+echo "==> Creating universal binary"
+BIN_PATH=".build/universal/${NAME}"
+mkdir -p "$(dirname "$BIN_PATH")"
+lipo -create -output "$BIN_PATH" "$ARM64_BIN" "$X86_64_BIN"
 
 echo "==> Ad-hoc signing"
 codesign --force --sign - --timestamp=none "$BIN_PATH"
