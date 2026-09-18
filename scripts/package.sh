@@ -60,7 +60,7 @@ echo "==> Staging $STAGE_DIR"
 rm -rf "$STAGE_DIR" "$TARBALL"
 mkdir -p "$STAGE_DIR"
 cp "$BIN_PATH" "$STAGE_DIR/"
-cp README.md LICENSE "$STAGE_DIR/" 2>/dev/null || true
+cp README.md README-fr.md LICENSE "$STAGE_DIR/" 2>/dev/null || true
 
 echo "==> Architectures"
 lipo -info "$STAGE_DIR/$NAME"
