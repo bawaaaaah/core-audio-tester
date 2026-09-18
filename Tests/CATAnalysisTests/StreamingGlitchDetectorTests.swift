@@ -55,10 +55,30 @@ import Testing
     @Test func clippingIsDetectedSeparately() {
         let detector = StreamingGlitchDetector(channel: 1, frequency: frequency, sampleRate: sampleRate)
         detector.calibrateNoiseFloor([Float](repeating: 0, count: 4800))
-        var samples = cleanSine(seconds: 0.1, amplitude: 0.25)
+        var samples = cleanSine(seconds: 1.0, amplitude: 0.25)
+        // Past the phase-lock window, so this exercises the steady-state path and proves a
+        // clipped sample is classified as `.clip` rather than falling through to `.click`.
+        samples[20000] = 1.0
+        detector.process(samples, startTimestampSeconds: 0)
+        let (incidents, _, summary) = detector.finish(totalDurationSeconds: 1.0)
+        #expect(incidents.contains { $0.type == .clip })
+        #expect(summary.clipCount == 1)
+        #expect(!incidents.contains { $0.type == .click })
+    }
+
+    /// Regression test for a blind spot where nothing at all was reported for the first
+    /// `phaseLockFrameTarget` frames (100ms at 48kHz): those samples are consumed by the
+    /// phase-lock DFT and never reach `processDetection`, so a channel that clipped right at
+    /// the start of a stability pass came back perfectly clean. Clipping is a pure amplitude
+    /// test and needs no phase reference, so it is now detected during the lock window too.
+    @Test func clippingDuringPhaseLockIsDetected() {
+        let detector = StreamingGlitchDetector(channel: 1, frequency: frequency, sampleRate: sampleRate)
+        detector.calibrateNoiseFloor([Float](repeating: 0, count: 4800))
+        var samples = cleanSine(seconds: 1.0, amplitude: 0.25)
+        // Index 100 sits well inside the 4800-frame phase-lock window.
         samples[100] = 1.0
         detector.process(samples, startTimestampSeconds: 0)
-        let (incidents, _, summary) = detector.finish(totalDurationSeconds: 0.1)
+        let (incidents, _, summary) = detector.finish(totalDurationSeconds: 1.0)
         #expect(incidents.contains { $0.type == .clip })
         #expect(summary.clipCount == 1)
     }

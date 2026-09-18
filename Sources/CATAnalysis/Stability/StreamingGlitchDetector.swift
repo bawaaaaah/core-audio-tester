@@ -119,6 +119,20 @@ public final class StreamingGlitchDetector {
             let needed = phaseLockFrameTarget - phaseLockBuffer.count
             let takeCount = max(min(needed, samples.count), 0)
             phaseLockBuffer.append(contentsOf: samples.prefix(takeCount))
+
+            // Clipping is a pure amplitude test — it needs no phase reference, so it stays
+            // detectable while we're still locking. Without this, anything that clipped inside
+            // the phase-lock window (the first 100ms at 48kHz) went completely unreported: those
+            // samples feed the lock DFT and are never handed to `processDetection`.
+            for (i, sample) in samples.prefix(takeCount).enumerated() where abs(sample) > 0.99 {
+                recordIncident(
+                    type: .clip,
+                    timestamp: startTimestampSeconds + Double(i) / sampleRate,
+                    durationMs: 1000.0 / sampleRate,
+                    severity: Double(abs(sample))
+                )
+            }
+
             totalSamples += Int64(takeCount)
             if phaseLockBuffer.count >= phaseLockFrameTarget {
                 lockPhase()
