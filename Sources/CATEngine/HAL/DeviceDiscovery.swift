@@ -8,9 +8,9 @@ public enum DeviceResolutionError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .notFound(let query):
-            return "No CoreAudio device matches \"\(query)\". Use --list-devices to see available devices."
+            return "Aucune interface CoreAudio ne correspond à \"\(query)\". Utilise --list-devices pour voir les interfaces disponibles."
         case .ambiguous(let query, let candidates):
-            return "\"\(query)\" matches multiple devices: \(candidates.joined(separator: ", ")). Be more specific or use the exact UID."
+            return "\"\(query)\" correspond à plusieurs interfaces : \(candidates.joined(separator: ", ")). Précise le nom ou utilise l'UID exact."
         }
     }
 }
@@ -73,7 +73,13 @@ public enum DeviceDiscovery {
             return exactUID
         }
         let lowered = query.lowercased()
-        let matches = devices.filter { $0.name.lowercased().contains(lowered) }
+        // An exact (case-insensitive) name wins over substring matches, so "WING" still resolves
+        // when another device is called e.g. "WING Aggregate".
+        let exactNames = devices.filter { $0.name.lowercased() == lowered }
+        if exactNames.count == 1 {
+            return exactNames[0]
+        }
+        let matches = exactNames.isEmpty ? devices.filter { $0.name.lowercased().contains(lowered) } : exactNames
         if matches.count == 1 {
             return matches[0]
         } else if matches.count > 1 {

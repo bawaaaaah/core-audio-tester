@@ -7,7 +7,8 @@ public enum HTMLReportRenderer {
         plan: TestPlan,
         results: [BufferSizeResult],
         recommendations: RecommendationSet,
-        wasInterrupted: Bool
+        wasInterrupted: Bool,
+        sweepError: String? = nil
     ) -> String {
         let sorted = results.sorted { $0.grantedFrames < $1.grantedFrames }
         let hasCPULoadData = sorted.contains { !$0.loadedStability.isEmpty }
@@ -15,9 +16,17 @@ public enum HTMLReportRenderer {
         let cpuLoadChart = renderCPULoadChart(sorted: sorted)
         let table = renderTable(sorted: sorted, safest: recommendations.safest.bufferSizeResult, tradeoff: recommendations.bestTradeoff.bufferSizeResult, hasCPULoadData: hasCPULoadData)
         let details = sorted.map { renderDetail(result: $0) }.joined(separator: "\n")
-        let interruptedNote = wasInterrupted
-            ? "<p class=\"warn\">Run interrompu (Ctrl-C) — ce rapport ne couvre que les tailles de buffer testées avant l'interruption.</p>"
-            : ""
+        var notes: [String] = []
+        if wasInterrupted {
+            notes.append("<p class=\"warn\">Test interrompu (Ctrl-C) — ce rapport ne couvre que ce qui a été mesuré avant l'interruption.</p>")
+        }
+        if let sweepError {
+            notes.append("<p class=\"warn\">Test arrêté sur une erreur : \(escape(sweepError)) — rapport partiel.</p>")
+        }
+        if plan.stabilitySignalKind.requiresTransparentLoopback {
+            notes.append("<p class=\"meta\">Mode à comparaison exacte : valable uniquement sur une boucle numérique transparente (gain compensé automatiquement). Une boucle analogique est signalée « non vérifiée ».</p>")
+        }
+        let interruptedNote = notes.joined(separator: "\n")
         let cpuLoadSectionHTML = hasCPULoadData
             ? """
               <h2>Performance en fonction de la charge CPU simulée</h2>
@@ -26,15 +35,20 @@ public enum HTMLReportRenderer {
             : ""
         let stabilitySignalDescription: String
         switch plan.stabilitySignalKind {
-        case .tone: stabilitySignalDescription = "sinusoïde à phase continue par canal"
-        case .whiteNoise: stabilitySignalDescription = "bruit blanc à comparaison exacte (échantillon par échantillon, après verrouillage par corrélation croisée)"
-        case .pinkNoise: stabilitySignalDescription = "bruit rose à comparaison exacte (échantillon par échantillon, après verrouillage par corrélation croisée)"
+        case .tone: stabilitySignalDescription = "sinusoïde continue par canal (phase, amplitude et offset ajustés par moindres carrés, amplitude suivie en RMS)"
+        case .whiteNoise: stabilitySignalDescription = "bruit blanc à comparaison exacte (échantillon par échantillon, après verrouillage par corrélation croisée et compensation du gain)"
+        case .pinkNoise: stabilitySignalDescription = "bruit rose à comparaison exacte (échantillon par échantillon, après verrouillage par corrélation croisée et compensation du gain)"
         case .wavFile:
             let filename = plan.wavFilePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "?"
-            stabilitySignalDescription = "fichier WAV \(escape(filename)) à comparaison exacte (échantillon par échantillon, après verrouillage par corrélation croisée)"
+            stabilitySignalDescription = "fichier WAV \(escape(filename)) à comparaison exacte (échantillon par échantillon, après verrouillage par corrélation croisée et compensation du gain)"
         }
 
         return """
+        <!DOCTYPE html>
+        <html lang="fr">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>core-audio-tester — \(escape(device.name))</title>
         <style>
           :root {
@@ -81,11 +95,15 @@ public enum HTMLReportRenderer {
           summary { cursor: pointer; font-weight: 600; }
           svg text { fill: var(--fg); font-family: -apple-system, sans-serif; }
           footer { margin-top: 3rem; color: var(--muted); font-size: 0.8rem; }
+          @media (max-width: 600px) { body { padding: 1rem; } }
         </style>
+        </head>
+        <body>
         <h1>core-audio-tester — \(escape(device.name))</h1>
         <p class="meta">
           UID: \(escape(device.uid)) · \(Int(device.nominalSampleRate)) Hz · \(device.inputChannelCount) entrées / \(device.outputChannelCount) sorties ·
-          Canaux testés : \(plan.pairs.count) paire(s) · Mode ping : \(plan.pingMode == .parallel ? "parallèle" : "séquentiel")
+          Canaux testés : \(plan.pairs.count) paire(s) · Mode ping : \(plan.pingMode == .parallel ? "parallèle" : "séquentiel") ·
+          Niveau : \(String(format: "%.0f", plan.outputLevelDBFS)) dBFS crête\(plan.ioLoadPercent > 0 ? " · Charge DSP simulée dans le callback : \(plan.ioLoadPercent) %" : "")\(plan.exclusiveAccess ? " · Accès exclusif (hog mode)" : "")
         </p>
         \(interruptedNote)
         <div class="cards">
@@ -100,8 +118,10 @@ public enum HTMLReportRenderer {
         <h2>Détail par taille de buffer</h2>
         \(details)
         <footer>
-          Méthodologie : rafales MLS (ordre 10, 1023 échantillons) pour la latence, \(stabilitySignalDescription) pour la stabilité, seuils de détection auto-calibrés sur le bruit de fond. \(plan.pingRepetitions) répétitions/paire, tolérance sporadique \(String(format: "%.2f", plan.sporadicToleranceWeightedPerMinute))/min.
+          Méthodologie : rafales MLS (ordre 10, 1023 échantillons, une séquence distincte par sortie en mode parallèle) pour la latence, \(stabilitySignalDescription) pour la stabilité, seuils de détection relatifs au niveau reçu et au bruit de fond mesuré. \(plan.pingRepetitions) répétitions/paire, tolérance sporadique \(String(format: "%.2f", plan.sporadicToleranceWeightedPerMinute))/min (clic 1, silence 2, dropout/overload/arrêt d'E/S 3). core-audio-tester \(escape(ToolVersion.current)).
         </footer>
+        </body>
+        </html>
         """
     }
 
@@ -110,7 +130,7 @@ public enum HTMLReportRenderer {
         <div class="card \(cssClass)">
           <h3>\(escape(title))</h3>
           <div class="big">\(result.grantedFrames) frames</div>
-          <p>Latence moyenne : \(String(format: "%.2f", result.meanLatencyMs)) ms · Incidents : \(result.stability.totalIncidentCount) · Overloads : \(result.stability.overloadCount)</p>
+          <p>Latence moyenne : \(latencyText(result.meanLatencyMs, measured: result.hasLatencyMeasurement)) · Incidents : \(result.stability.totalIncidentCount) · Overloads : \(result.stability.overloadCount)</p>
           <p>\(escape(rationale))</p>
         </div>
         """
@@ -124,6 +144,9 @@ public enum HTMLReportRenderer {
             if r.grantedFrames == safest.grantedFrames { tags += "<span class=\"tag safe\">SAFEST</span>"; rowClass = "tag-safe" }
             if r.grantedFrames == tradeoff.grantedFrames { tags += "<span class=\"tag tradeoff\">TRADE-OFF</span>"; rowClass = rowClass.isEmpty ? "tag-tradeoff" : rowClass }
             if !r.stability.allChannelsVerified { tags += "<span class=\"tag warn\">NON VÉRIFIÉ</span>" }
+            if r.wasInterrupted { tags += "<span class=\"tag warn\">INTERROMPU</span>" }
+            if r.stability.droppedRingBufferRecords > 0 { tags += "<span class=\"tag warn\">CAPTURE INCOMPLÈTE</span>" }
+            if r.hasUnreliablePings { tags += "<span class=\"tag warn\">PING ?</span>" }
             let theoreticalMs = r.halLatency.theoreticalRoundTripMs(sampleRate: r.sampleRate)
             let cpuLoadCell: String
             if hasCPULoadData {
@@ -139,14 +162,16 @@ public enum HTMLReportRenderer {
             <tr class="\(rowClass)">
               <td>\(r.grantedFrames)\(tags)</td>
               <td>\(Int(r.sampleRate))</td>
-              <td>\(String(format: "%.2f", r.meanLatencyMs))</td>
-              <td>\(String(format: "%.2f", r.worstLatencyMs))</td>
+              <td>\(r.hasLatencyMeasurement ? String(format: "%.2f", r.meanLatencyMs) : "—")</td>
+              <td>\(r.hasLatencyMeasurement ? String(format: "%.2f", r.worstLatencyMs) : "—")</td>
               <td>\(String(format: "%.2f", theoreticalMs))</td>
               <td>\(r.stability.overloadCount)</td>
-              <td>\(r.stability.perChannel.reduce(0) { $0 + $1.dropoutCount })</td>
-              <td>\(r.stability.perChannel.reduce(0) { $0 + $1.silenceCount })</td>
-              <td>\(r.stability.perChannel.reduce(0) { $0 + $1.clickCount })</td>
-              <td>\(r.stability.perChannel.reduce(0) { $0 + $1.clipCount })</td>
+              <td>\(r.stability.ioStoppedAbnormallyCount)</td>
+              <td>\(r.stability.dropoutCount)</td>
+              <td>\(r.stability.silenceCount)</td>
+              <td>\(r.stability.clickCount)</td>
+              <td>\(r.stability.clipCount)</td>
+              <td>\(r.stability.droppedRingBufferRecords)</td>
               <td>\(String(format: "%.1f", r.stability.minCleanPercentage))%</td>
               \(cpuLoadCell)
             </tr>
@@ -157,7 +182,7 @@ public enum HTMLReportRenderer {
         <table>
           <thead><tr>
             <th>Buffer (frames)</th><th>Sample rate</th><th>Latence moy. (ms)</th><th>Latence max (ms)</th>
-            <th>Latence théorique (ms)</th><th>Overloads</th><th>Dropouts</th><th>Silences</th><th>Clicks</th><th>Clips</th><th>Propre (min)</th>\(cpuLoadHeader)
+            <th>Latence théorique (ms)</th><th>Overloads</th><th>Arrêts E/S</th><th>Dropouts</th><th>Silences</th><th>Clics</th><th>Clips</th><th>Captures perdues</th><th>Propre (min)</th>\(cpuLoadHeader)
           </tr></thead>
           <tbody>\(rows)</tbody>
         </table>
@@ -167,15 +192,15 @@ public enum HTMLReportRenderer {
     private static func renderDetail(result: BufferSizeResult) -> String {
         var pairRows = ""
         for p in result.pingResults {
-            let flag = p.isUnreliable ? " ⚠️ ambiguë" : ""
+            let flag = !p.hasMeasurement ? " ⚠️ non détectée" : (p.isUnreliable ? " ⚠️ ambiguë" : "")
             pairRows += """
             <tr>
               <td>Out \(p.pair.outputChannel) → In \(p.pair.inputChannel)</td>
               <td>\(p.repetitionsDetected)/\(p.repetitionsRequested)</td>
-              <td>\(String(format: "%.2f", p.meanMs))</td>
-              <td>\(String(format: "%.2f", p.medianMs))</td>
-              <td>\(String(format: "%.2f", p.minMs))–\(String(format: "%.2f", p.maxMs))</td>
-              <td>\(String(format: "%.2f", p.stddevMs))</td>
+              <td>\(p.hasMeasurement ? String(format: "%.2f", p.meanMs) : "—")</td>
+              <td>\(p.hasMeasurement ? String(format: "%.2f", p.medianMs) : "—")</td>
+              <td>\(p.hasMeasurement ? "\(String(format: "%.2f", p.minMs))–\(String(format: "%.2f", p.maxMs))" : "—")</td>
+              <td>\(p.hasMeasurement ? String(format: "%.2f", p.stddevMs) : "—")</td>
               <td>\(p.ambiguousCount)\(flag)</td>
             </tr>
             """
@@ -184,17 +209,18 @@ public enum HTMLReportRenderer {
         for c in result.stability.perChannel.sorted(by: { $0.channel < $1.channel }) {
             let cleanCell = c.verified
                 ? "\(String(format: "%.1f", c.cleanPercentage))%"
-                : "<span class=\"tag warn\">NON VÉRIFIÉ</span>"
+                : "<span class=\"tag warn\" title=\"\(escape(c.unverifiedReason ?? ""))\">NON VÉRIFIÉ</span>"
+            let note = c.verified ? (c.reacquisitionCount > 0 ? "référence perdue puis retrouvée \(c.reacquisitionCount) fois" : "") : (c.unverifiedReason ?? "")
             channelRows += """
             <tr>
-              <td>Canal \(c.channel)</td><td>\(c.dropoutCount)</td><td>\(c.silenceCount)</td><td>\(c.clickCount)</td><td>\(c.clipCount)</td><td>\(cleanCell)</td>
+              <td>Entrée \(c.channel)</td><td>\(c.dropoutCount)</td><td>\(c.silenceCount)</td><td>\(c.clickCount)</td><td>\(c.clipCount)</td><td>\(cleanCell)</td><td style="text-align:left">\(escape(note))</td>
             </tr>
             """
         }
         let cpuLoadSection = renderCPULoadSection(result: result)
         return """
         <details>
-          <summary>Taille \(result.grantedFrames) frames — \(String(format: "%.2f", result.meanLatencyMs)) ms moy., \(result.stability.totalIncidentCount) incident(s)</summary>
+          <summary>Taille \(result.grantedFrames) frames — \(latencyText(result.meanLatencyMs, measured: result.hasLatencyMeasurement)) moy., \(result.stability.totalIncidentCount) incident(s)</summary>
           <h4>Latence par paire</h4>
           <div class="overflow"><table>
             <thead><tr><th>Paire</th><th>Détections</th><th>Moy (ms)</th><th>Médiane (ms)</th><th>Min–Max (ms)</th><th>Jitter (σ)</th><th>Ambiguës</th></tr></thead>
@@ -202,7 +228,7 @@ public enum HTMLReportRenderer {
           </table></div>
           <h4>Stabilité par canal</h4>
           <div class="overflow"><table>
-            <thead><tr><th>Canal</th><th>Dropouts</th><th>Silences</th><th>Clicks</th><th>Clips</th><th>Propre</th></tr></thead>
+            <thead><tr><th>Canal</th><th>Dropouts</th><th>Silences</th><th>Clics</th><th>Clips</th><th>Propre</th><th>Remarque</th></tr></thead>
             <tbody>\(channelRows)</tbody>
           </table></div>
           \(cpuLoadSection)
@@ -218,14 +244,14 @@ public enum HTMLReportRenderer {
             let memSuffix = loaded.memoryPressureActive ? " <span class=\"tag warn\">+ mémoire</span>" : ""
             rows += """
             <tr>
-              <td>\(loaded.cpuLoadPercent)%\(memSuffix)</td><td>\(s.overloadCount)</td><td>\(s.totalIncidentCount)</td><td>\(String(format: "%.1f", s.minCleanPercentage))%</td>
+              <td>\(loaded.cpuLoadPercent)%\(memSuffix)</td><td>\(s.overloadCount)</td><td>\(s.ioStoppedAbnormallyCount)</td><td>\(s.totalIncidentCount)</td><td>\(String(format: "%.1f", s.minCleanPercentage))%\(s.isTrustworthy ? "" : " <span class=\"tag warn\">NON VÉRIFIÉ</span>")</td>
             </tr>
             """
         }
         return """
         <h4>Résilience à la charge CPU simulée</h4>
         <div class="overflow"><table>
-          <thead><tr><th>Charge CPU</th><th>Overloads</th><th>Incidents</th><th>Propre</th></tr></thead>
+          <thead><tr><th>Charge CPU</th><th>Overloads</th><th>Arrêts E/S</th><th>Incidents</th><th>Propre</th></tr></thead>
           <tbody>\(rows)</tbody>
         </table></div>
         """
@@ -260,9 +286,9 @@ public enum HTMLReportRenderer {
             let cx = x(i)
             var yTop = marginTop + plotHeight
             let counts: [(Double, String)] = [
-                (Double(r.stability.perChannel.reduce(0) { $0 + $1.dropoutCount }), "var(--danger)"),
-                (Double(r.stability.perChannel.reduce(0) { $0 + $1.silenceCount }), "var(--warn)"),
-                (Double(r.stability.perChannel.reduce(0) { $0 + $1.clickCount }), "#eab308"),
+                (Double(r.stability.dropoutCount), "var(--danger)"),
+                (Double(r.stability.silenceCount), "var(--warn)"),
+                (Double(r.stability.clickCount), "#eab308"),
             ]
             for (count, color) in counts where count > 0 {
                 let barHeight = (marginTop + plotHeight) - yIncidents(count)
@@ -292,7 +318,7 @@ public enum HTMLReportRenderer {
             let px = x(i)
             meanPoints += "\(px),\(yLatency(r.meanLatencyMs)) "
             bandPathTop += "\(px),\(yLatency(r.worstLatencyMs)) "
-            let minMs = r.pingResults.map(\.minMs).min() ?? r.meanLatencyMs
+            let minMs = r.hasLatencyMeasurement ? r.bestLatencyMs : r.meanLatencyMs
             bandPathBottom = "\(px),\(yLatency(minMs)) " + bandPathBottom
         }
         svg += "<polygon points=\"\(bandPathTop)\(bandPathBottom)\" fill=\"var(--accent)\" opacity=\"0.12\"/>"
@@ -400,6 +426,10 @@ public enum HTMLReportRenderer {
 
         svg += "</svg>"
         return svg
+    }
+
+    private static func latencyText(_ ms: Double, measured: Bool) -> String {
+        measured ? String(format: "%.2f ms", ms) : "non mesurée"
     }
 
     private static func escape(_ s: String) -> String {

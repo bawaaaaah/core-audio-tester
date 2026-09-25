@@ -5,6 +5,7 @@ public struct RawCLIOptions {
 
     public var listDevices = false
     public var help = false
+    public var version = false
     public var device: String?
     public var inputChannels: String?
     public var outputChannels: String?
@@ -25,6 +26,8 @@ public struct RawCLIOptions {
     public var memPressureMB: Int?
     public var dumpIncidentAudioPath: String?
     public var wavFilePath: String?
+    public var outputLevelDBFS: Double?
+    public var ioLoadPercent: Int?
 
     public var hasExplicitChannelSelection: Bool {
         inputChannels != nil || outputChannels != nil || pairs != nil
@@ -33,58 +36,88 @@ public struct RawCLIOptions {
 
 public enum ArgumentParserError: Error, CustomStringConvertible {
     case unknownFlag(String)
+    case unexpectedArgument(String)
     case missingValue(String)
+    case invalidNumber(flag: String, value: String)
     case conflictingAutoAndSelection
     case conflictingWavFileAndSignal
 
     public var description: String {
         switch self {
         case .unknownFlag(let flag):
-            return "Unknown flag: \(flag). Use --help to see available options."
+            return "Option inconnue : \(flag). Utilise --help pour la liste des options."
+        case .unexpectedArgument(let argument):
+            return "Argument inattendu : \"\(argument)\". Les options s'écrivent --nom valeur (voir --help)."
         case .missingValue(let flag):
-            return "Flag \(flag) requires a value."
+            return "L'option \(flag) attend une valeur."
+        case .invalidNumber(let flag, let value):
+            return "Valeur invalide pour \(flag) : \"\(value)\" (nombre attendu)."
         case .conflictingAutoAndSelection:
-            return "--auto cannot be combined with --in/--out/--pairs. Omit --auto to test a specific channel selection, or omit the selection flags to run the full auto benchmark."
+            return "--auto ne se combine pas avec --in/--out/--pairs : retire --auto pour tester une sélection, ou retire la sélection pour le benchmark complet."
         case .conflictingWavFileAndSignal:
-            return "--wav-file can only be used with --stability-signal wav (or by omitting --stability-signal entirely)."
+            return "--wav-file ne s'utilise qu'avec --stability-signal wav (ou sans --stability-signal)."
         }
     }
 }
 
 public enum ArgumentParser {
-    private static let noValueFlags: Set<String> = ["--list-devices", "--help", "-h", "--auto", "--exclusive", "--yes", "--ping-sequential", "--cpu-load", "--mem-pressure"]
-
     public static func parse(_ arguments: [String]) throws -> RawCLIOptions {
         var options = RawCLIOptions()
-        var iterator = arguments.makeIterator()
+        var index = 0
 
-        func nextValue(for flag: String) throws -> String {
-            guard let value = iterator.next() else { throw ArgumentParserError.missingValue(flag) }
-            return value
-        }
-
-        while let arg = iterator.next() {
+        while index < arguments.count {
+            let arg = arguments[index]
+            index += 1
+            guard arg.hasPrefix("-") else {
+                throw ArgumentParserError.unexpectedArgument(arg)
+            }
             var flag = arg
             var inlineValue: String?
-            if let eq = arg.firstIndex(of: "="), arg.hasPrefix("--") {
+            if arg.hasPrefix("--"), let eq = arg.firstIndex(of: "=") {
                 flag = String(arg[arg.startIndex..<eq])
                 inlineValue = String(arg[arg.index(after: eq)...])
             }
 
             func value() throws -> String {
                 if let inlineValue { return inlineValue }
-                return try nextValue(for: flag)
+                // A following "--flag" means this one's value was forgotten, not that the value
+                // is literally "--flag".
+                guard index < arguments.count, !arguments[index].hasPrefix("--") else {
+                    throw ArgumentParserError.missingValue(flag)
+                }
+                defer { index += 1 }
+                return arguments[index]
+            }
+            func intValue() throws -> Int {
+                let raw = try value()
+                guard let parsed = Int(raw.trimmingCharacters(in: .whitespaces)) else {
+                    throw ArgumentParserError.invalidNumber(flag: flag, value: raw)
+                }
+                return parsed
+            }
+            func levelValue() throws -> Double {
+                let raw = try value()
+                var text = raw.trimmingCharacters(in: .whitespaces).lowercased()
+                for suffix in ["dbfs", "db"] where text.hasSuffix(suffix) {
+                    text = String(text.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
+                    break
+                }
+                guard let parsed = Double(text), parsed.isFinite else {
+                    throw ArgumentParserError.invalidNumber(flag: flag, value: raw)
+                }
+                return parsed
             }
 
             switch flag {
             case "--list-devices": options.listDevices = true
             case "--help", "-h": options.help = true
+            case "--version": options.version = true
             case "--device": options.device = try value()
             case "--in": options.inputChannels = try value()
             case "--out": options.outputChannels = try value()
             case "--pairs": options.pairs = try value()
             case "--buffer-sizes": options.bufferSizes = try value()
-            case "--ping-reps": options.pingRepetitions = Int(try value())
+            case "--ping-reps": options.pingRepetitions = try intValue()
             case "--ping-sequential": options.pingSequential = true
             case "--duration": options.duration = try value()
             case "--config": options.configPath = try value()
@@ -96,9 +129,11 @@ public enum ArgumentParser {
             case "--cpu-load-levels": options.cpuLoadLevels = try value()
             case "--stability-signal": options.stabilitySignal = try value()
             case "--mem-pressure": options.memPressure = true
-            case "--mem-pressure-mb": options.memPressureMB = Int(try value())
+            case "--mem-pressure-mb": options.memPressureMB = try intValue()
             case "--dump-incident-audio": options.dumpIncidentAudioPath = try value()
             case "--wav-file": options.wavFilePath = try value()
+            case "--level": options.outputLevelDBFS = try levelValue()
+            case "--io-load": options.ioLoadPercent = try intValue()
             default:
                 throw ArgumentParserError.unknownFlag(flag)
             }
@@ -108,7 +143,7 @@ public enum ArgumentParser {
             throw ArgumentParserError.conflictingAutoAndSelection
         }
         if options.wavFilePath != nil, let signal = options.stabilitySignal,
-           !["wav", "wav-file", "file"].contains(signal.lowercased())
+           !TestPlanResolver.wavSignalAliases.contains(signal.lowercased())
         {
             throw ArgumentParserError.conflictingWavFileAndSignal
         }
@@ -117,35 +152,48 @@ public enum ArgumentParser {
     }
 
     public static let usageText = """
-    core-audio-tester — CoreAudio buffer-size benchmark
+    core-audio-tester — benchmark CoreAudio des tailles de buffer
 
-    USAGE:
-      core-audio-tester                          Assistant interactif (si aucun --device n'est donné)
+    UTILISATION :
+      core-audio-tester                          Assistant interactif (sans --device)
       core-audio-tester --list-devices
-      core-audio-tester --device <name-or-uid> [options]
+      core-audio-tester --device <nom-ou-uid> [options]
 
-    OPTIONS:
-      --device <name-or-uid>     Target CoreAudio device (e.g. "WING")
-      --in <spec>                Input channels to test, e.g. "1-7" or "1,3,5" (default: all, see --auto)
-      --out <spec>                Output channels to test, e.g. "1-7"
-      --pairs <spec>             Explicit output:input pairs, e.g. "1:1,2:2,5:3" (overrides index-aligned pairing)
-      --buffer-sizes <csv>       Buffer sizes to sweep, e.g. "32,64,128,256,512,1024,2048"
-      --ping-reps <n>            Repetitions per pair for the latency ping test (default 20)
-      --ping-sequential          Ping one pair at a time instead of the default parallel mode
-      --duration <spec>          Stability test duration per buffer size, e.g. "60s", "5m" (default 60s)
-      --config <path>            JSON config file (CLI flags override its fields)
-      --auto                     Force full-device benchmark (default when no channel selection is given)
-      --exclusive                Take hog mode (exclusive device access) during the run
-      --cpu-load                 Also run the stability test under simulated CPU load (default levels 25,50,75,85,90,95%)
-      --cpu-load-levels <csv>    Simulated CPU load levels to test, in %, e.g. "25,50,75" (implies --cpu-load)
-      --stability-signal <kind>  Stability test signal: "sine" (default), "noise" (white noise), "pink" (pink noise), or "wav" (compare against --wav-file) — noise/wav modes use an exact sample-accurate comparison
-      --wav-file <path>          WAV file to play and verify instead of synthetic noise (implies --stability-signal wav). Mono broadcasts to every output channel; stereo alternates odd/even channels; an N-channel file cycles across more output channels than it has tracks. Must match the device's sample rate exactly — resample externally (e.g. afconvert) if it doesn't. Default test duration becomes the file's own length unless --duration overrides it (a longer duration loops the file)
-      --mem-pressure             Also simulate memory pressure during each loaded stability pass (implies --cpu-load if no levels given)
-      --mem-pressure-mb <n>      Memory pressure target size in MB (implies --mem-pressure) — may slow other apps during the test
-      --dump-incident-audio <dir> Noise/wav signal modes only: for each stability incident, write a stereo WAV (L=captured, R=expected reference) with ~300ms of context on each side, for manual listening/inspection (max 5 per channel)
-      --yes                      Skip the pre-run time-estimate confirmation prompt
-      --out-path <path>          Base path for the generated report files (default: ./core-audio-tester-report)
-      --list-devices             List CoreAudio devices and exit
-      --help                     Show this help
+    OPTIONS :
+      --device <nom-ou-uid>       Interface CoreAudio à tester (ex. "WING")
+      --in <spec>                 Entrées à tester, ex. "1-7" ou "1,3,5" (par défaut : toutes, voir --auto)
+      --out <spec>                Sorties à tester, ex. "1-7" (appariées aux entrées dans l'ordre)
+      --pairs <spec>              Paires sortie:entrée explicites, ex. "1:1,2:2,5:3" (patch croisé)
+      --buffer-sizes <csv>        Tailles à balayer, ex. "32,64,128,256,512,1024,2048"
+      --ping-reps <n>             Répétitions du ping de latence par paire (défaut 20)
+      --ping-sequential           Un ping à la fois au lieu du mode parallèle par défaut
+      --duration <spec>           Durée du test de stabilité par taille, ex. "60s", "5m" (défaut 60s)
+      --level <dBFS>              Niveau crête de tous les signaux de test (défaut -12 dBFS, de -60 à -3)
+      --stability-signal <type>   Signal de stabilité : "sine" (défaut), "noise" (bruit blanc), "pink"
+                                  (bruit rose) ou "wav" (fichier, voir --wav-file). Les modes bruit/wav
+                                  comparent échantillon par échantillon : ils exigent une boucle
+                                  numérique transparente (bit-exact, gain compensé automatiquement).
+                                  Pour une boucle analogique, garde "sine".
+      --wav-file <chemin>         Fichier WAV de référence (implique --stability-signal wav). Mono :
+                                  diffusé sur toutes les sorties ; stéréo : alterne canaux impairs/pairs ;
+                                  N canaux : répartis en boucle. Doit être à la fréquence de l'interface
+                                  (rééchantillonne avant avec afconvert si besoin). Durée par défaut : celle
+                                  du fichier, sauf --duration (le fichier boucle alors).
+      --cpu-load                  Rejoue le test de stabilité sous charge CPU simulée
+                                  (paliers par défaut 25,50,75,85,90,95 %)
+      --cpu-load-levels <csv>     Paliers de charge CPU en %, ex. "25,50,75" (implique --cpu-load)
+      --mem-pressure              Ajoute une pression mémoire simulée pendant ces passes chargées
+      --mem-pressure-mb <n>       Taille de la pression mémoire en Mo (implique --mem-pressure)
+      --io-load <pct>             Occupe <pct> % de chaque cycle d'E/S dans le callback audio pendant les
+                                  tests de stabilité (0-90), pour émuler la charge DSP d'une vraie appli
+      --exclusive                 Prend l'accès exclusif à l'interface (hog mode) pendant le test
+      --dump-incident-audio <dir> Écrit un WAV stéréo par incident (G = capturé, D = attendu),
+                                  ~300 ms de contexte de chaque côté (5 max par canal et par passe)
+      --config <chemin>           Fichier de configuration JSON (les options CLI l'emportent)
+      --out-path <chemin>         Base des fichiers de rapport (défaut ./core-audio-tester-report)
+      --yes                       Pas de confirmation avant le lancement
+      --list-devices              Liste les interfaces CoreAudio et quitte
+      --version                   Affiche la version et quitte
+      --help                      Affiche cette aide
     """
 }

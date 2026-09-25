@@ -42,7 +42,8 @@ public final class MemoryPressureGenerator: @unchecked Sendable {
     }
 
     private func runChurnLoop() {
-        let pageSize = 4096
+        // One write per VM page keeps every page resident (16 KB on Apple silicon, 4 KB on Intel).
+        let pageSize = max(Int(getpagesize()), 4096)
         // `UnsafeMutableRawPointer.allocate` traps on failure; a too-large request on a
         // resource-constrained machine should fail soft (no simulated pressure) rather than
         // crash the whole benchmark run, so this goes through raw `posix_memalign` instead.

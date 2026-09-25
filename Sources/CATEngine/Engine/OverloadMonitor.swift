@@ -1,21 +1,18 @@
 import CoreAudio
+import Foundation
 
-/// Registers HAL property listeners for xrun/overload/device-alive notifications.
-/// The header for kAudioDeviceProcessorOverload explicitly warns it's "usually sent from
-/// the AudioDevice's IO thread" — listener bodies here do the absolute minimum (an atomic
-/// increment via a method call on the engine), no logging or allocation.
+/// Registers HAL property listeners for overloads, abnormal IO stops, device loss and sample-rate
+/// changes. Listener bodies only bump an atomic counter on the engine — no logging or allocation.
 final class OverloadMonitor {
+    private struct Registration {
+        var address: AudioObjectPropertyAddress
+        let block: AudioObjectPropertyListenerBlock
+    }
+
     private let deviceID: AudioObjectID
     private unowned let engine: AudioIOEngine
     private let queue = DispatchQueue(label: "core-audio-tester.overload-monitor")
-
-    private var overloadAddr = AudioObjectProperty.address(kAudioDeviceProcessorOverload)
-    private var stoppedAddr = AudioObjectProperty.address(kAudioDevicePropertyIOStoppedAbnormally)
-    private var aliveAddr = AudioObjectProperty.address(kAudioDevicePropertyDeviceIsAlive)
-
-    private var overloadBlock: AudioObjectPropertyListenerBlock?
-    private var stoppedBlock: AudioObjectPropertyListenerBlock?
-    private var aliveBlock: AudioObjectPropertyListenerBlock?
+    private var registrations: [Registration] = []
 
     init(deviceID: AudioObjectID, engine: AudioIOEngine) {
         self.deviceID = deviceID
@@ -23,35 +20,28 @@ final class OverloadMonitor {
     }
 
     func install() throws {
-        if AudioObjectProperty.exists(deviceID, overloadAddr) {
-            let block: AudioObjectPropertyListenerBlock = { [weak engine] _, _ in engine?.recordOverload() }
-            try caCheck(AudioObjectAddPropertyListenerBlock(deviceID, &overloadAddr, queue, block), "AddPropertyListenerBlock(overload)")
-            overloadBlock = block
+        try register(kAudioDeviceProcessorOverload) { [weak engine] in engine?.recordOverload() }
+        try register(kAudioDevicePropertyIOStoppedAbnormally) { [weak engine] in engine?.recordIOStoppedAbnormally() }
+        try register(kAudioDevicePropertyDeviceIsAlive) { [weak engine] in engine?.checkStillAlive() }
+        try register(kAudioDevicePropertyNominalSampleRate) { [weak engine] in engine?.recordSampleRateChange() }
+    }
+
+    private func register(_ selector: AudioObjectPropertySelector, _ action: @escaping () -> Void) throws {
+        var address = AudioObjectProperty.address(selector)
+        guard AudioObjectProperty.exists(deviceID, address) else { return }
+        let block: AudioObjectPropertyListenerBlock = { _, _ in action() }
+        let status = AudioObjectAddPropertyListenerBlock(deviceID, &address, queue, block)
+        guard status == noErr else {
+            uninstall()
+            throw CoreAudioError.osStatus(status, "AudioObjectAddPropertyListenerBlock(\(selector))")
         }
-        if AudioObjectProperty.exists(deviceID, stoppedAddr) {
-            let block: AudioObjectPropertyListenerBlock = { [weak engine] _, _ in engine?.recordIOStoppedAbnormally() }
-            try caCheck(AudioObjectAddPropertyListenerBlock(deviceID, &stoppedAddr, queue, block), "AddPropertyListenerBlock(ioStoppedAbnormally)")
-            stoppedBlock = block
-        }
-        if AudioObjectProperty.exists(deviceID, aliveAddr) {
-            let block: AudioObjectPropertyListenerBlock = { [weak engine] _, _ in engine?.checkStillAlive() }
-            try caCheck(AudioObjectAddPropertyListenerBlock(deviceID, &aliveAddr, queue, block), "AddPropertyListenerBlock(deviceIsAlive)")
-            aliveBlock = block
-        }
+        registrations.append(Registration(address: address, block: block))
     }
 
     func uninstall() {
-        if let overloadBlock {
-            AudioObjectRemovePropertyListenerBlock(deviceID, &overloadAddr, queue, overloadBlock)
+        for var registration in registrations {
+            AudioObjectRemovePropertyListenerBlock(deviceID, &registration.address, queue, registration.block)
         }
-        if let stoppedBlock {
-            AudioObjectRemovePropertyListenerBlock(deviceID, &stoppedAddr, queue, stoppedBlock)
-        }
-        if let aliveBlock {
-            AudioObjectRemovePropertyListenerBlock(deviceID, &aliveAddr, queue, aliveBlock)
-        }
-        overloadBlock = nil
-        stoppedBlock = nil
-        aliveBlock = nil
+        registrations = []
     }
 }
