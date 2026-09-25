@@ -1,37 +1,61 @@
+import CATEngine
 import Foundation
 
-/// Diagnostic aid, opt-in via `--dump-incident-audio <dir>`: writes the raw captured audio
-/// surrounding a stability incident to a WAV file, so the exact samples the detector flagged can
-/// be inspected/listened to directly instead of trusting the incident classification alone.
-public final class IncidentAudioDumper {
+/// Diagnostic aid (`--dump-incident-audio <dir>`): writes the audio around a stability incident to
+/// a stereo WAV file (left = captured, right = expected reference), so what the detector flagged can
+/// be listened to and inspected sample by sample.
+///
+/// Files are named `<pass>_chNN_<type>_t<seconds>_<n>.wav`, where the pass label identifies the
+/// buffer size and load level. Writes happen on a background queue, off the capture drain thread.
+public final class IncidentAudioDumper: @unchecked Sendable {
     private let directory: URL
     private let sampleRate: Double
+    private let passLabel: String
     private let maxDumpsPerChannel: Int
     private var dumpCountByChannel: [Int: Int] = [:]
+    private let writeQueue = DispatchQueue(label: "core-audio-tester.incident-dumps")
 
-    public init(directory: String, sampleRate: Double, maxDumpsPerChannel: Int = 5) {
+    public init(directory: String, sampleRate: Double, passLabel: String, maxDumpsPerChannel: Int = 5) {
         self.directory = URL(fileURLWithPath: directory)
         self.sampleRate = sampleRate
+        self.passLabel = passLabel
         self.maxDumpsPerChannel = maxDumpsPerChannel
-        try? FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
+        } catch {
+            Log.warn("impossible de créer le dossier des extraits audio \"\(directory)\" : \(error.localizedDescription)")
+        }
     }
 
+    /// Called from the drain thread only.
     public func shouldDump(channel: Int) -> Bool {
         (dumpCountByChannel[channel] ?? 0) < maxDumpsPerChannel
     }
 
-    /// `captured` and `expected` must be the same length and sample-aligned: written as a stereo
-    /// WAV (L=captured, R=expected) so both can be compared sample-for-sample in any audio editor.
+    /// `captured` and `expected` must be sample-aligned. Called from the drain thread only.
     public func dump(channel: Int, incidentType: String, timestampSeconds: Double, captured: [Float], expected: [Float]) {
         let count = dumpCountByChannel[channel, default: 0]
         dumpCountByChannel[channel] = count + 1
-        let filename = String(format: "ch%02d_%@_t%.3f_%d.wav", channel, incidentType, max(timestampSeconds, 0), count)
-        let url = directory.appendingPathComponent(filename)
-        var interleaved = [Float](repeating: 0, count: captured.count * 2)
-        for i in 0..<captured.count {
-            interleaved[i * 2] = captured[i]
-            interleaved[i * 2 + 1] = i < expected.count ? expected[i] : 0
+        let channelLabel = String(format: "%02d", channel)
+        let timeLabel = String(format: "%.3f", max(timestampSeconds, 0))
+        let url = directory.appendingPathComponent("\(passLabel)_ch\(channelLabel)_\(incidentType)_t\(timeLabel)_\(count).wav")
+        let rate = sampleRate
+        writeQueue.async {
+            var interleaved = [Float](repeating: 0, count: captured.count * 2)
+            for i in 0..<captured.count {
+                interleaved[i * 2] = captured[i]
+                interleaved[i * 2 + 1] = i < expected.count ? expected[i] : 0
+            }
+            do {
+                try WAVWriter.writeFloat32(interleavedSamples: interleaved, channelCount: 2, sampleRate: rate, to: url)
+            } catch {
+                Log.warn("échec de l'écriture de \(url.lastPathComponent) : \(error.localizedDescription)")
+            }
         }
-        try? WAVWriter.writeFloat32(interleavedSamples: interleaved, channelCount: 2, sampleRate: sampleRate, to: url)
+    }
+
+    /// Blocks until every queued file is on disk.
+    public func waitUntilWritten() {
+        writeQueue.sync {}
     }
 }
