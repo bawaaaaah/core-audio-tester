@@ -22,13 +22,13 @@ public enum WAVReader {
         public var description: String {
             switch self {
             case .unreadable(let path, let reason):
-                return "Could not read WAV file \"\(path)\": \(reason)"
+                return "Impossible de lire le fichier WAV \"\(path)\" : \(reason)"
             case .malformed(let path, let reason):
-                return "WAV file \"\(path)\" is invalid: \(reason)"
+                return "Fichier WAV \"\(path)\" invalide : \(reason)"
             case .unsupportedFormat(let path, let reason):
-                return "WAV file \"\(path)\" uses an unsupported format: \(reason)"
+                return "Le fichier WAV \"\(path)\" utilise un format non pris en charge : \(reason)"
             case .empty(let path):
-                return "WAV file \"\(path)\" contains no samples."
+                return "Le fichier WAV \"\(path)\" ne contient aucun échantillon."
             }
         }
     }
@@ -45,7 +45,7 @@ public enum WAVReader {
               bytes[0..<4].elementsEqual(Array("RIFF".utf8)),
               bytes[8..<12].elementsEqual(Array("WAVE".utf8))
         else {
-            throw WAVReaderError.malformed(path: path, reason: "missing RIFF/WAVE header")
+            throw WAVReaderError.malformed(path: path, reason: "en-tête RIFF/WAVE absent")
         }
 
         func readU16(_ at: Int) -> UInt16 {
@@ -73,14 +73,14 @@ public enum WAVReader {
 
             if tag == "fmt " {
                 guard chunkSize >= 16 else {
-                    throw WAVReaderError.malformed(path: path, reason: "\"fmt \" chunk too short")
+                    throw WAVReaderError.malformed(path: path, reason: "bloc \"fmt \" trop court")
                 }
                 let format = readU16(bodyStart)
                 if format == 0xFFFE {
                     // WAVE_FORMAT_EXTENSIBLE: the real codec is the first 2 bytes of the 16-byte
                     // SubFormat GUID living at offset 24 within the extended fmt chunk.
                     guard chunkSize >= 40 else {
-                        throw WAVReaderError.malformed(path: path, reason: "extended (EXTENSIBLE) \"fmt \" chunk too short")
+                        throw WAVReaderError.malformed(path: path, reason: "bloc \"fmt \" étendu (EXTENSIBLE) trop court")
                     }
                     audioFormat = readU16(bodyStart + 24)
                 } else {
@@ -97,16 +97,16 @@ public enum WAVReader {
         }
 
         guard let audioFormat, let numChannels, numChannels > 0, let sampleRate, let bitsPerSample, bitsPerSample > 0 else {
-            throw WAVReaderError.malformed(path: path, reason: "missing or incomplete \"fmt \" chunk")
+            throw WAVReaderError.malformed(path: path, reason: "bloc \"fmt \" absent ou incomplet")
         }
         guard let dataRange else {
-            throw WAVReaderError.malformed(path: path, reason: "missing \"data\" chunk")
+            throw WAVReaderError.malformed(path: path, reason: "bloc \"data\" absent")
         }
 
         let bytesPerSample = bitsPerSample / 8
         let blockAlign = bytesPerSample * numChannels
         guard blockAlign > 0 else {
-            throw WAVReaderError.unsupportedFormat(path: path, reason: "invalid block alignment")
+            throw WAVReaderError.unsupportedFormat(path: path, reason: "alignement de bloc invalide")
         }
         let frameCount = dataRange.count / blockAlign
         guard frameCount > 0 else {
@@ -134,7 +134,7 @@ public enum WAVReader {
                 let bits = UInt64(readU32(byteOffset)) | (UInt64(readU32(byteOffset + 4)) << 32)
                 return Float(Double(bitPattern: bits))
             default:
-                throw WAVReaderError.unsupportedFormat(path: path, reason: "codec \(audioFormat) at \(bitsPerSample) bits is not supported")
+                throw WAVReaderError.unsupportedFormat(path: path, reason: "codec \(audioFormat) en \(bitsPerSample) bits non pris en charge")
             }
         }
 

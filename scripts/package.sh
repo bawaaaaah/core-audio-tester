@@ -25,6 +25,26 @@ NAME="core-audio-tester"
 STAGE_DIR="dist/${NAME}-${VERSION}-macos-universal"
 TARBALL="dist/${NAME}-${VERSION}-macos-universal.tar.gz"
 
+# The version is stamped into the binary as an embedded Info.plist (__TEXT,__info_plist), which
+# `core-audio-tester --version` and the JSON report read back through Bundle.main.
+PLIST_PATH="$PWD/.build/version-Info.plist"
+mkdir -p "$(dirname "$PLIST_PATH")"
+cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>${NAME}</string>
+    <key>CFBundleName</key>
+    <string>${NAME}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION#v}</string>
+</dict>
+</plist>
+PLIST
+LINK_FLAGS=(-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$PLIST_PATH")
+
 # Each slice is built in its own scratch path and lipo'd together afterwards, rather than
 # via `swift build --arch arm64 --arch x86_64`. Passing both architectures to a single
 # invocation routes through the Xcode build system and fails with "Unexpected duplicate
@@ -34,8 +54,8 @@ build_slice() {
     local arch="$1"
     local scratch=".build/universal-${arch}"
     echo "==> Building release slice for ${arch}" >&2
-    swift build -c release --arch "$arch" --scratch-path "$scratch" >&2
-    echo "$(swift build -c release --arch "$arch" --scratch-path "$scratch" --show-bin-path)/${NAME}"
+    swift build -c release --arch "$arch" --scratch-path "$scratch" "${LINK_FLAGS[@]}" >&2
+    echo "$(swift build -c release --arch "$arch" --scratch-path "$scratch" "${LINK_FLAGS[@]}" --show-bin-path)/${NAME}"
 }
 
 ARM64_BIN="$(build_slice arm64)"
@@ -55,6 +75,14 @@ lipo -create -output "$BIN_PATH" "$ARM64_BIN" "$X86_64_BIN"
 
 echo "==> Ad-hoc signing"
 codesign --force --sign - --timestamp=none "$BIN_PATH"
+
+echo "==> Checking the embedded version"
+REPORTED="$("$BIN_PATH" --version)"
+if [[ "$REPORTED" != "${NAME} ${VERSION#v}" ]]; then
+    echo "error: binary reports \"$REPORTED\", expected \"${NAME} ${VERSION#v}\"" >&2
+    exit 1
+fi
+echo "$REPORTED"
 
 echo "==> Staging $STAGE_DIR"
 rm -rf "$STAGE_DIR" "$TARBALL"

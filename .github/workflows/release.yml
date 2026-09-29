@@ -20,12 +20,21 @@ jobs:
     runs-on: macos-15
 
     steps:
+      # The tag reaches the shell through the environment, never by interpolating it into the
+      # script text, so a crafted tag name can't inject commands.
       - name: Resolve tag
         id: tag
-        run: echo "name=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9A-Za-z._-]+$ ]]; then
+            echo "error: unexpected tag name: $TAG_NAME" >&2
+            exit 1
+          fi
+          echo "name=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ steps.tag.outputs.name }}
           fetch-depth: 0
@@ -39,10 +48,12 @@ jobs:
         run: swift test
 
       - name: Build universal release binary & package
-        run: scripts/package.sh "${{ steps.tag.outputs.name }}"
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.name }}
+        run: scripts/package.sh "$TAG_NAME"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: core-audio-tester-${{ steps.tag.outputs.name }}-macos-universal
           path: |
@@ -51,14 +62,17 @@ jobs:
           if-no-files-found: error
 
       - name: Generate release notes
-        run: scripts/release-notes.sh "${{ steps.tag.outputs.name }}"
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.name }}
+        run: scripts/release-notes.sh "$TAG_NAME"
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.tag.outputs.name }}
         run: |
-          gh release create "${{ steps.tag.outputs.name }}" \
-            --title "core-audio-tester ${{ steps.tag.outputs.name }}" \
+          gh release create "$TAG_NAME" \
+            --title "core-audio-tester $TAG_NAME" \
             --notes-file release-notes.md \
             --generate-notes \
             dist/*.tar.gz \

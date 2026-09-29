@@ -12,9 +12,11 @@ discontinuities, overloads) under load, then recommends the lowest buffer size t
 perfectly stable.
 
 Built for multichannel interfaces (Behringer WING, RME, MOTU, Focusrite…), but it works
-with any CoreAudio device, including the Mac's built-in input and output.
+with any CoreAudio device that has both inputs and outputs wired in a loopback. To loop
+between two separate devices — for example the Mac's built-in output and input, which macOS
+exposes as two distinct devices — create an aggregate device in *Audio MIDI Setup* first.
 
-> **Note:** the tool's own console output and interactive wizard are in French.
+> **Note:** the tool's own console output, help, interactive wizard and reports are in French.
 
 ## What it does
 
@@ -26,13 +28,33 @@ For **each requested buffer size** (32, 64, 128… frames):
    sequentially.
 2. **Stability test** — plays a reference signal continuously for the requested duration
    and compares the captured input against the reference, sample by sample, to detect
-   incidents. Choose the signal: sine, white noise, pink noise, or **your own WAV file**.
+   incidents (clicks, silences, dropouts), overloads and abnormal IO stops. Choose the
+   signal:
+   - **sine** (default) — works on any loopback, analog or digital;
+   - **white noise**, **pink noise** or **your own WAV file** — an exact comparison that
+     needs a **bit-transparent digital loopback**. Loopback gain and polarity are
+     compensated automatically; an analog path (converters, filtering) is reported as
+     "unverified" instead of producing false clicks.
 3. **Load test** (optional) — replays the stability test at several simulated CPU load
-   levels (25%, 50%, 75%, 85%, 90%, 95%) and, if requested, under memory pressure — this
-   is where buffer sizes that are too low give out.
+   levels (25%, 50%, 75%, 85%, 90%, 95%) and, if requested, under memory pressure.
+   `--io-load` also adds compute load **inside the audio callback itself**, like a real
+   DAW's processing — which is what makes buffer sizes that are too low give out in practice.
 
 At the end it generates an **HTML report** and a **JSON export**, plus a terminal summary
-with the recommended buffer size.
+with two recommendations:
+
+- **"zero crash"**: the smallest buffer size that is clean at idle **and** at every load
+  level tested;
+- **"best trade-off"**: the smallest size whose weighted event rate (click 1, silence 2,
+  dropout/overload/IO stop 3 per minute) stays within the tolerance.
+
+A pass only counts as evidence when every channel was verified (locked onto its reference
+signal), no captured audio was dropped for lack of analysis time, and it ran its full
+duration: a muted or misrouted channel reads "unverified", never "clean".
+
+> **Mind the level:** the test plays broadband bursts and a continuous signal on every
+> tested output, at **−12 dBFS peak** by default (`--level` to adjust). Mute or turn down
+> any PA, speaker or headphones connected to those outputs.
 
 ## Installation
 
@@ -120,8 +142,12 @@ core-audio-tester --device "WING" --auto \
   --dump-incident-audio ./incidents \
   --yes
 
-# Verify the device against your own WAV file
+# Verify the device against your own WAV file (digital loopback)
 core-audio-tester --device "MOTU" --wav-file ./reference-44100.wav
+
+# Closer to a real session: exclusive access, lower level,
+# 40% of every cycle spent inside the audio callback
+core-audio-tester --device "WING" --exclusive --level -20 --io-load 40
 ```
 
 ### Options
@@ -137,26 +163,55 @@ core-audio-tester --device "MOTU" --wav-file ./reference-44100.wav
 | `--duration <spec>` | Stability test duration per buffer, e.g. `60s`, `5m` (default `60s`) |
 | `--ping-reps <n>` | Repetitions per pair for the latency test (default 20) |
 | `--ping-sequential` | Ping one pair at a time instead of the default parallel mode |
-| `--stability-signal <kind>` | `sine` (default), `noise`, `pink` or `wav` |
+| `--stability-signal <kind>` | `sine` (default, any loopback), `noise`, `pink` or `wav` (bit-transparent digital loopback) |
 | `--wav-file <path>` | Reference WAV file (implies `--stability-signal wav`) |
 | `--cpu-load` | Also replay the stability test under simulated CPU load |
 | `--cpu-load-levels <csv>` | Load levels in %, e.g. `25,50,75` (implies `--cpu-load`) |
 | `--mem-pressure` / `--mem-pressure-mb <n>` | Add simulated memory pressure |
-| `--dump-incident-audio <dir>` | Write a stereo WAV (captured / reference) per incident |
-| `--exclusive` | Take exclusive device access (hog mode) |
+| `--level <dBFS>` | Peak level of every test signal (default `-12`, from `-60` to `-3`) |
+| `--io-load <pct>` | Spend `pct`% of each IO cycle inside the audio callback during stability tests (0-90) |
+| `--dump-incident-audio <dir>` | Write a stereo WAV (captured / expected) per incident, at most 5 per channel and pass |
+| `--exclusive` | Take exclusive device access (hog mode): CoreAudio's buffer size is a per-process setting, and another application using the same device can skew the test |
 | `--config <path>` | JSON config file (CLI flags take precedence) |
 | `--out-path <path>` | Base path for the report files (default `./core-audio-tester-report`) |
 | `--yes` | Skip the duration-estimate confirmation prompt |
+| `--version` | Print the version |
 | `--help` | Full help |
+
+### Configuration file
+
+`--config <path>` reads a JSON object whose keys are all optional; command-line options take
+precedence. An unknown key (a typo) is an error.
+
+```json
+{
+  "device": "WING",
+  "outputChannels": "1-8",
+  "inputChannels": "1-8",
+  "bufferSizes": [64, 128, 256],
+  "stabilityDurationSeconds": 120,
+  "stabilitySignal": "sine",
+  "cpuLoadLevelsPercent": [50, 75],
+  "outputLevelDBFS": -18,
+  "ioLoadPercent": 40,
+  "exclusiveAccess": true
+}
+```
+
+Accepted keys: `device`, `inputChannels`, `outputChannels`, `pairs`
+(`[{"output": 1, "input": 1}]`), `bufferSizes`, `pingRepetitions`, `pingMode`
+(`parallel`/`sequential`), `stabilityDurationSeconds`, `sporadicToleranceWeightedPerMinute`,
+`exclusiveAccess`, `cpuLoadLevelsPercent`, `stabilitySignal`, `memoryPressureMB`, `wavFile`,
+`outputLevelDBFS`, `ioLoadPercent`.
 
 ### Exit codes
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success — no incident at any buffer size |
-| `1` | Finished, but at least one buffer size was not perfectly clean |
-| `64` | Usage error (unknown flag, invalid config…) |
-| `65` | Device error (not found, configuration refused…) |
+| `0` | Success — no incident at any buffer size, idle or under load, and everything verified |
+| `1` | Finished, but at least one pass was not perfectly clean or could not be verified |
+| `64` | Usage error (unknown flag or invalid value, invalid config…) |
+| `65` | Device error (not found, configuration refused, unplugged or sample rate changed mid-run — the partial report is then written) |
 | `77` | Microphone access denied |
 | `130` | Interrupted (Ctrl-C) — the partial report is still written |
 
@@ -167,7 +222,7 @@ core-audio-tester --device "MOTU" --wav-file ./reference-44100.wav
 - `core-audio-tester-report.json` — the same data, script-friendly
 - `--dump-incident-audio <dir>` — one stereo WAV per incident (left = captured, right =
   expected reference), with ~300 ms of context on each side, so you can hear what actually
-  happened
+  happened. Named `buf<size>_<repos|cpuNN>_chNN_<type>_t<seconds>_<n>.wav`
 
 ## Architecture
 
@@ -176,12 +231,12 @@ Sources/
   CATEngine/        CoreAudio HAL layer: device discovery and configuration, real-time
                     I/O engine, lock-free ring buffer, overload monitoring, CPU/memory
                     load generators, CLI parsing and test plan
-  CATAnalysis/      Offline analysis: cross-correlation onset detection, latency
-                    statistics, glitch detectors (streaming and exact), recommendation
-                    engine, HTML/JSON/terminal rendering
+  CATAnalysis/      Offline analysis: MLS ping and cross-correlation, latency statistics,
+                    a single glitch detector (GlitchDetector) driven by a sine or
+                    noise/WAV reference, recommendation engine, HTML/JSON/terminal rendering
   core-audio-tester/ Executable: entry point, interactive wizard, console UI
-Tests/              Unit tests for the ring buffer, channel specs and the onset/glitch
-                    detectors
+Tests/              Unit tests (CLI, configuration, models, WAV, MLS, detectors) and
+                    ping/stability session tests over a simulated loopback
 ```
 
 ## Development
@@ -192,6 +247,9 @@ swift test           # unit tests
 swift build -c release
 scripts/package.sh   # universal binary + tarball + checksum in dist/
 ```
+
+`scripts/package.sh` stamps the version into the binary (`core-audio-tester --version`, the
+JSON report's `toolVersion`); a plain `swift build` reports `dev`.
 
 GitHub Actions CI builds and tests every push and pull request on macOS, and attaches the
 packaged universal binary to the run's artifacts. Pushing a `v*` tag triggers the release

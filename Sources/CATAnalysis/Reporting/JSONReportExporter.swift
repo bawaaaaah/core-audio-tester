@@ -8,6 +8,10 @@ public struct RecommendationExport: Codable {
 }
 
 public struct ReportExport: Codable {
+    /// 2: stability results carry planned duration, abnormal IO stops, interruption and
+    /// per-channel verification details; the always-zero overload cross-reference fields are gone.
+    public static let currentSchemaVersion = 2
+
     public let schemaVersion: Int
     public let toolVersion: String
     public let device: DeviceExport
@@ -17,6 +21,8 @@ public struct ReportExport: Codable {
     public let bestTradeoffRecommendation: RecommendationExport
     public let sameAsSafest: Bool
     public let wasInterrupted: Bool
+    /// Why the sweep stopped early, when it did (the results above are then partial).
+    public let error: String?
 
     public struct DeviceExport: Codable {
         public let uid: String
@@ -34,11 +40,12 @@ public enum JSONReportExporter {
         results: [BufferSizeResult],
         recommendations: RecommendationSet,
         wasInterrupted: Bool,
+        sweepError: String? = nil,
         to path: String
     ) throws {
         let report = ReportExport(
-            schemaVersion: 1,
-            toolVersion: "0.1.0",
+            schemaVersion: ReportExport.currentSchemaVersion,
+            toolVersion: ToolVersion.current,
             device: .init(
                 uid: device.uid, name: device.name,
                 inputChannelCount: device.inputChannelCount, outputChannelCount: device.outputChannelCount,
@@ -49,7 +56,8 @@ public enum JSONReportExporter {
             safestRecommendation: .init(grantedFrames: recommendations.safest.bufferSizeResult.grantedFrames, rationale: recommendations.safest.rationale, isFallback: recommendations.safest.isFallback),
             bestTradeoffRecommendation: .init(grantedFrames: recommendations.bestTradeoff.bufferSizeResult.grantedFrames, rationale: recommendations.bestTradeoff.rationale, isFallback: recommendations.bestTradeoff.isFallback),
             sameAsSafest: recommendations.sameAsSafest,
-            wasInterrupted: wasInterrupted
+            wasInterrupted: wasInterrupted,
+            error: sweepError
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

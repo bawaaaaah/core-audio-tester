@@ -1,5 +1,22 @@
 // swift-tools-version: 6.0
+import Foundation
 import PackageDescription
+
+// With only the Command Line Tools installed (no Xcode), Swift Testing lives in a framework
+// directory SwiftPM doesn't search by default. Point the test targets at it only when that
+// framework is actually there, rather than hard-coding the paths for every setup.
+let commandLineToolsFrameworks = "/Library/Developer/CommandLineTools/Library/Developer/Frameworks"
+let needsCommandLineToolsTesting = FileManager.default.fileExists(atPath: commandLineToolsFrameworks + "/Testing.framework")
+let testSwiftSettings: [SwiftSetting] = needsCommandLineToolsTesting
+    ? [.unsafeFlags(["-F", commandLineToolsFrameworks])]
+    : []
+let testLinkerSettings: [LinkerSetting] = needsCommandLineToolsTesting
+    ? [.unsafeFlags([
+        "-F", commandLineToolsFrameworks,
+        "-Xlinker", "-rpath", "-Xlinker", commandLineToolsFrameworks,
+        "-Xlinker", "-rpath", "-Xlinker", "/Library/Developer/CommandLineTools/Library/Developer/usr/lib",
+    ])]
+    : []
 
 let package = Package(
     name: "core-audio-tester",
@@ -28,22 +45,14 @@ let package = Package(
         .testTarget(
             name: "CATEngineTests",
             dependencies: ["CATEngine"],
-            swiftSettings: [.unsafeFlags(["-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks"])],
-            linkerSettings: [.unsafeFlags([
-                "-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
-                "-Xlinker", "-rpath", "-Xlinker", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
-                "-Xlinker", "-rpath", "-Xlinker", "/Library/Developer/CommandLineTools/Library/Developer/usr/lib",
-            ])]
+            swiftSettings: testSwiftSettings,
+            linkerSettings: testLinkerSettings
         ),
         .testTarget(
             name: "CATAnalysisTests",
-            dependencies: ["CATAnalysis"],
-            swiftSettings: [.unsafeFlags(["-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks"])],
-            linkerSettings: [.unsafeFlags([
-                "-F", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
-                "-Xlinker", "-rpath", "-Xlinker", "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
-                "-Xlinker", "-rpath", "-Xlinker", "/Library/Developer/CommandLineTools/Library/Developer/usr/lib",
-            ])]
+            dependencies: ["CATEngine", "CATAnalysis"],
+            swiftSettings: testSwiftSettings,
+            linkerSettings: testLinkerSettings
         ),
     ]
 )

@@ -12,7 +12,6 @@ public final class CancellationController: @unchecked Sendable {
     public static let shared = CancellationController()
 
     private let cancelled = Atomic<Bool>(false)
-    private let secondSignal = Atomic<Bool>(false)
     private var sources: [DispatchSourceSignal] = []
 
     private init() {}
@@ -36,11 +35,10 @@ public final class CancellationController: @unchecked Sendable {
 
     public func requestCancellation() {
         if cancelled.exchange(true, ordering: .relaxed) {
-            secondSignal.store(true, ordering: .relaxed)
-            FileHandle.standardError.write(Data("\nSecond interrupt received, forcing exit.\n".utf8))
+            FileHandle.standardError.write(Data("\nDeuxième interruption : arrêt immédiat (pas de rapport).\n".utf8))
             exit(ExitCodes.interrupted)
         } else {
-            FileHandle.standardError.write(Data("\nInterrupt received, finishing current step and writing partial report...\n".utf8))
+            FileHandle.standardError.write(Data("\nInterruption reçue : fin de l'étape en cours puis écriture du rapport partiel… (Ctrl-C à nouveau pour quitter immédiatement)\n".utf8))
         }
     }
 

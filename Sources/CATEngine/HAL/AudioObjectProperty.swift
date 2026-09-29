@@ -7,7 +7,7 @@ public enum CoreAudioError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .osStatus(let status, let context):
-            return "\(context) failed with OSStatus \(status)"
+            return "\(context) a échoué (OSStatus \(status))"
         }
     }
 }

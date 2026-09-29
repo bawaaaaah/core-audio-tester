@@ -16,9 +16,9 @@ public enum ChannelMapError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .unsupportedFormat(let detail):
-            return "Unsupported stream format: \(detail)"
+            return "Format de flux non pris en charge : \(detail)"
         case .channelOutOfRange(let requested, let available):
-            return "Channel \(requested) is out of range (device exposes \(available) channels on this side)"
+            return "Le canal \(requested) n'existe pas (l'interface expose \(available) canaux de ce côté)"
         }
     }
 }
@@ -45,7 +45,7 @@ public struct ChannelMap {
 
             let format = try AudioObjectProperty.read(streamID, AudioObjectProperty.address(kAudioStreamPropertyVirtualFormat), as: AudioStreamBasicDescription.self)
             guard format.mFormatID == kAudioFormatLinearPCM, format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
-                throw ChannelMapError.unsupportedFormat("stream \(streamID) is not linear PCM float (formatID=\(format.mFormatID), flags=\(format.mFormatFlags))")
+                throw ChannelMapError.unsupportedFormat("le flux \(streamID) n'est pas en PCM linéaire flottant (formatID=\(format.mFormatID), flags=\(format.mFormatFlags))")
             }
             bufferChannelCounts.append(Int(format.mChannelsPerFrame))
         }
@@ -59,6 +59,9 @@ public struct ChannelMap {
         self.locations = built
         self.totalChannels = bufferChannelCounts.reduce(0, +)
     }
+
+    /// Highest 1-based channel number present on this side (0 if none).
+    public var highestChannel: Int { locations.keys.max() ?? 0 }
 
     public func location(forDeviceChannel channel: Int) throws -> ChannelLocation {
         guard let loc = locations[channel] else {

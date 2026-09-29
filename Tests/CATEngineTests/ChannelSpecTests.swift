@@ -18,8 +18,18 @@ import Testing
         #expect(try ChannelSpec.parse("5,1-3,2") == [1, 2, 3, 5])
     }
 
+    @Test func toleratesSpacesAroundTheDash() throws {
+        #expect(try ChannelSpec.parse(" 1 - 3 ") == [1, 2, 3])
+    }
+
     @Test func invalidToken() {
-        #expect(throws: (any Error).self) { try ChannelSpec.parse("abc") }
+        #expect(throws: ChannelSpecError.self) { try ChannelSpec.parse("abc") }
+        #expect(throws: ChannelSpecError.self) { try ChannelSpec.parse("5-2") }
+    }
+
+    /// Regression: "1-1000000000" used to materialize a billion-element set before any range check.
+    @Test func hugeRangeIsRejectedUpFront() {
+        #expect(throws: ChannelSpecError.self) { try ChannelSpec.parse("1-1000000000") }
     }
 
     @Test func formatRoundTrip() throws {

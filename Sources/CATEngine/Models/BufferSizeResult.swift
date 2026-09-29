@@ -3,7 +3,9 @@ public struct HALLatencyInfo: Sendable, Codable {
     public var outputDeviceLatencyFrames: UInt32
     public var inputSafetyOffsetFrames: UInt32
     public var outputSafetyOffsetFrames: UInt32
+    /// Largest stream latency among the streams carrying the selected input channels.
     public var inputStreamLatencyFrames: UInt32
+    /// Largest stream latency among the streams carrying the selected output channels.
     public var outputStreamLatencyFrames: UInt32
     public var bufferFrames: UInt32
 
@@ -72,9 +74,12 @@ public struct PairLatencyResult: Sendable, Codable {
         self.outlierCount = outlierCount
     }
 
+    /// True when no repetition was detected at all — the statistics above are then meaningless.
+    public var hasMeasurement: Bool { repetitionsDetected > 0 }
+
     /// True when too few repetitions correlated cleanly to trust this pair's numbers.
     public var isUnreliable: Bool {
-        repetitionsDetected == 0 || Double(ambiguousCount) > Double(repetitionsRequested) * 0.5
+        !hasMeasurement || Double(ambiguousCount) > Double(repetitionsRequested) * 0.5
     }
 }
 
@@ -108,13 +113,27 @@ public struct ChannelStabilitySummary: Sendable, Codable {
     public var clickCount: Int
     public var clipCount: Int
     public var cleanPercentage: Double
-    /// False when this channel never locked onto its reference signal (noise/WAV modes only —
-    /// sine mode has no comparable lock-confidence gate and is always `true`): with nothing ever
-    /// compared, `cleanPercentage` reads 100% by construction even though nothing was verified.
-    /// Downstream code must treat an unverified channel as untrusted, not as confirmed-clean.
+    /// False when the channel never locked onto its reference signal (no signal, wrong routing, or
+    /// a loopback that isn't transparent enough for an exact comparison). Nothing was compared,
+    /// so `cleanPercentage` then says nothing about the channel's health.
     public var verified: Bool
+    /// Why the channel couldn't be verified, when `verified` is false.
+    public var unverifiedReason: String?
+    /// Times the detector lost the reference mid-pass (after a slip or a long dropout) and had to
+    /// lock onto it again.
+    public var reacquisitionCount: Int
 
-    public init(channel: Int, dropoutCount: Int, silenceCount: Int, clickCount: Int, clipCount: Int, cleanPercentage: Double, verified: Bool = true) {
+    public init(
+        channel: Int,
+        dropoutCount: Int,
+        silenceCount: Int,
+        clickCount: Int,
+        clipCount: Int,
+        cleanPercentage: Double,
+        verified: Bool = true,
+        unverifiedReason: String? = nil,
+        reacquisitionCount: Int = 0
+    ) {
         self.channel = channel
         self.dropoutCount = dropoutCount
         self.silenceCount = silenceCount
@@ -122,53 +141,62 @@ public struct ChannelStabilitySummary: Sendable, Codable {
         self.clipCount = clipCount
         self.cleanPercentage = cleanPercentage
         self.verified = verified
+        self.unverifiedReason = unverifiedReason
+        self.reacquisitionCount = reacquisitionCount
     }
+
+    /// Clips are reported but not counted as incidents: they mean the level is too hot, not that
+    /// the buffer size is too small.
+    public var incidentCount: Int { dropoutCount + silenceCount + clickCount }
 }
 
 public struct StabilityResult: Sendable, Codable {
+    public var plannedDurationSeconds: Double
     public var durationSeconds: Double
     public var overloadCount: Int
+    public var ioStoppedAbnormallyCount: Int
+    /// Detailed incidents, capped per channel; per-type counts live in `perChannel`.
     public var incidents: [Incident]
     public var truncatedIncidentCount: Int
     public var perChannel: [ChannelStabilitySummary]
-    public var correlatedCount: Int
-    public var silentOverloadCount: Int
-    public var unexplainedGlitchCount: Int
+    /// Capture records the ring buffer dropped because analysis fell behind — audio that was
+    /// delivered by the device but never checked.
     public var droppedRingBufferRecords: Int
+    /// The pass was cut short (Ctrl-C).
+    public var wasInterrupted: Bool
 
     public init(
+        plannedDurationSeconds: Double,
         durationSeconds: Double,
         overloadCount: Int,
+        ioStoppedAbnormallyCount: Int,
         incidents: [Incident],
         truncatedIncidentCount: Int,
         perChannel: [ChannelStabilitySummary],
-        correlatedCount: Int,
-        silentOverloadCount: Int,
-        unexplainedGlitchCount: Int,
-        droppedRingBufferRecords: Int
+        droppedRingBufferRecords: Int,
+        wasInterrupted: Bool
     ) {
+        self.plannedDurationSeconds = plannedDurationSeconds
         self.durationSeconds = durationSeconds
         self.overloadCount = overloadCount
+        self.ioStoppedAbnormallyCount = ioStoppedAbnormallyCount
         self.incidents = incidents
         self.truncatedIncidentCount = truncatedIncidentCount
         self.perChannel = perChannel
-        self.correlatedCount = correlatedCount
-        self.silentOverloadCount = silentOverloadCount
-        self.unexplainedGlitchCount = unexplainedGlitchCount
         self.droppedRingBufferRecords = droppedRingBufferRecords
+        self.wasInterrupted = wasInterrupted
     }
 
-    public var totalIncidentCount: Int {
-        incidents.filter { $0.type != .clip }.count + truncatedIncidentCount
-    }
+    public var dropoutCount: Int { perChannel.reduce(0) { $0 + $1.dropoutCount } }
+    public var silenceCount: Int { perChannel.reduce(0) { $0 + $1.silenceCount } }
+    public var clickCount: Int { perChannel.reduce(0) { $0 + $1.clickCount } }
+    public var clipCount: Int { perChannel.reduce(0) { $0 + $1.clipCount } }
+
+    /// Audio incidents (dropouts, silences, clicks) across all channels — clips excluded.
+    public var totalIncidentCount: Int { dropoutCount + silenceCount + clickCount }
 
     public var minCleanPercentage: Double {
         perChannel.map(\.cleanPercentage).min() ?? 100.0
-    }
-
-    /// False if any channel never locked onto its reference signal — see `ChannelStabilitySummary.verified`.
-    public var allChannelsVerified: Bool {
-        perChannel.allSatisfy(\.verified)
     }
 
     public var meanCleanPercentage: Double {
@@ -176,18 +204,37 @@ public struct StabilityResult: Sendable, Codable {
         return perChannel.map(\.cleanPercentage).reduce(0, +) / Double(perChannel.count)
     }
 
-    /// Severity-weighted incidents per minute (click=1, silence=2, dropout=3; clips excluded).
-    public func weightedIncidentRatePerMinute(minutes: Double) -> Double {
-        guard minutes > 0 else { return 0 }
-        let weighted = incidents.reduce(0.0) { total, incident in
-            switch incident.type {
-            case .click: return total + 1.0
-            case .silence: return total + 2.0
-            case .dropout: return total + 3.0
-            case .clip: return total
-            }
-        }
-        return (weighted + Double(truncatedIncidentCount) * 1.0) / minutes
+    /// False if any channel never locked onto its reference signal — see `ChannelStabilitySummary.verified`.
+    public var allChannelsVerified: Bool {
+        perChannel.allSatisfy(\.verified)
+    }
+
+    public var completedPlannedDuration: Bool {
+        !wasInterrupted && durationSeconds + 0.25 >= plannedDurationSeconds
+    }
+
+    /// No overload, no abnormal IO stop and no audio incident.
+    public var isClean: Bool {
+        overloadCount == 0 && ioStoppedAbnormallyCount == 0 && totalIncidentCount == 0
+    }
+
+    /// Every channel was verified, no captured audio went unchecked and the pass ran its full
+    /// duration — without this, "clean" only means "nothing was seen".
+    public var isTrustworthy: Bool {
+        allChannelsVerified && droppedRingBufferRecords == 0 && completedPlannedDuration
+    }
+
+    public var isFullyClean: Bool { isClean && isTrustworthy }
+
+    /// Severity-weighted events per minute: click 1, silence 2, dropout 3, overload 3, abnormal IO stop 3.
+    public func weightedIncidentRatePerMinute() -> Double {
+        let minutes = max(durationSeconds / 60.0, 1.0 / 60.0)
+        let weighted = Double(clickCount)
+            + 2.0 * Double(silenceCount)
+            + 3.0 * Double(dropoutCount)
+            + 3.0 * Double(overloadCount)
+            + 3.0 * Double(ioStoppedAbnormallyCount)
+        return weighted / minutes
     }
 }
 
@@ -213,6 +260,7 @@ public struct BufferSizeResult: Sendable, Codable {
     public var pingResults: [PairLatencyResult]
     public var stability: StabilityResult
     public var loadedStability: [LoadedStabilityResult]
+    /// Some pass of this buffer size was cut short (Ctrl-C).
     public var wasInterrupted: Bool
 
     public init(
@@ -235,31 +283,51 @@ public struct BufferSizeResult: Sendable, Codable {
         self.wasInterrupted = wasInterrupted
     }
 
+    /// Pairs whose latency was actually measured; pairs with no detection would otherwise drag
+    /// the averages toward zero.
+    public var measuredPingResults: [PairLatencyResult] { pingResults.filter(\.hasMeasurement) }
+
+    public var hasLatencyMeasurement: Bool { !measuredPingResults.isEmpty }
+
     public var meanLatencyMs: Double {
-        guard !pingResults.isEmpty else { return 0 }
-        return pingResults.map(\.meanMs).reduce(0, +) / Double(pingResults.count)
+        let measured = measuredPingResults
+        guard !measured.isEmpty else { return 0 }
+        return measured.map(\.meanMs).reduce(0, +) / Double(measured.count)
     }
 
     public var worstLatencyMs: Double {
-        pingResults.map(\.maxMs).max() ?? 0
+        measuredPingResults.map(\.maxMs).max() ?? 0
     }
 
-    public var isFullyClean: Bool {
-        stability.overloadCount == 0 && stability.totalIncidentCount == 0 && stability.allChannelsVerified
+    public var bestLatencyMs: Double {
+        measuredPingResults.map(\.minMs).min() ?? 0
     }
 
-    public var hasAmbiguousPairs: Bool {
+    public var meanJitterMs: Double {
+        let measured = measuredPingResults
+        guard !measured.isEmpty else { return 0 }
+        return measured.map(\.stddevMs).reduce(0, +) / Double(measured.count)
+    }
+
+    public var hasUnreliablePings: Bool {
         pingResults.contains { $0.isUnreliable }
     }
 
-    /// Highest simulated CPU load level (among those tested, 0 meaning the idle baseline) that
-    /// stayed fully clean, in ascending order of confidence — `nil` if even the idle baseline had
-    /// incidents (in which case CPU load isn't the relevant variable at all).
+    /// Clean and trustworthy at idle.
+    public var isFullyClean: Bool { stability.isFullyClean }
+
+    /// Clean and trustworthy under every simulated load level tested (vacuously true if none).
+    public var isCleanUnderLoad: Bool {
+        loadedStability.allSatisfy { $0.stability.isFullyClean }
+    }
+
+    /// Highest simulated CPU load level (0 meaning the idle baseline) up to which every tested
+    /// level stayed fully clean — `nil` if even the idle baseline wasn't.
     public var highestCleanCPULoadPercent: Int? {
         guard isFullyClean else { return nil }
         var best = 0
         for loaded in loadedStability.sorted(by: { $0.cpuLoadPercent < $1.cpuLoadPercent }) {
-            guard loaded.stability.overloadCount == 0 && loaded.stability.totalIncidentCount == 0 && loaded.stability.allChannelsVerified else { break }
+            guard loaded.stability.isFullyClean else { break }
             best = loaded.cpuLoadPercent
         }
         return best

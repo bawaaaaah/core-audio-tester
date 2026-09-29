@@ -14,66 +14,73 @@ public struct RecommendationSet {
 }
 
 public enum RecommendationEngine {
+    /// "Safest": the smallest buffer size that is fully clean and trustworthy at idle *and* under
+    /// every simulated load level tested. "Best trade-off": the smallest trustworthy size whose
+    /// weighted event rate (overloads and IO stops included) stays within the sporadic tolerance.
+    ///
+    /// A pass only counts as evidence when it is trustworthy: every channel verified, no captured
+    /// audio dropped unchecked, full duration run. A "clean" pass that isn't trustworthy means
+    /// nothing was seen, not that nothing happened.
     public static func recommend(results: [BufferSizeResult], sporadicTolerancePerMinute: Double) -> RecommendationSet? {
         guard !results.isEmpty else { return nil }
         let sorted = results.sorted { $0.grantedFrames < $1.grantedFrames }
+        let trustworthy = sorted.filter(\.stability.isTrustworthy)
+        let hasLoadData = sorted.contains { !$0.loadedStability.isEmpty }
 
-        // A result where some channel never locked onto its reference signal reads as "0
-        // incidents, 100% clean" by construction — nothing was ever compared, so that's not
-        // evidence of health, it's an absence of evidence. Recommending it as safe would be
-        // exactly the silent-failure-looks-like-success trap this tool exists to avoid, so it's
-        // excluded from consideration entirely unless literally nothing verified.
-        let verifiable = sorted.filter(\.stability.allChannelsVerified)
-
-        let clean = verifiable.filter(\.isFullyClean)
         let safest: Recommendation
-        if let best = clean.first {
+        if let best = trustworthy.first(where: { $0.isFullyClean && $0.isCleanUnderLoad }) {
+            let loadNote: String
+            if let maxLoad = best.loadedStability.map(\.cpuLoadPercent).max() {
+                loadNote = " ni sous charge CPU simulée (jusqu'à \(maxLoad) %)"
+            } else {
+                loadNote = ""
+            }
             safest = Recommendation(
                 bufferSizeResult: best,
-                rationale: "Aucun incident (overload ou glitch audio) détecté sur toute la durée du test de stabilité (\(Int(best.stability.durationSeconds))s) — plus petite taille testée qui soit 100% propre.",
+                rationale: "Aucun incident, overload ni arrêt d'E/S au repos\(loadNote) sur toute la durée du test (\(Int(best.stability.durationSeconds)) s) — plus petite taille testée entièrement propre et vérifiée." + pingNote(best),
                 isFallback: false
             )
-        } else if let fallback = fallbackByIncidentCount(verifiable) {
+        } else if hasLoadData, let idleClean = trustworthy.first(where: \.isFullyClean) {
+            let tolerated = idleClean.highestCleanCPULoadPercent ?? 0
+            let toleratedText = tolerated > 0 ? "elle reste propre jusqu'à \(tolerated) % de charge CPU simulée" : "elle décroche dès le premier palier de charge CPU simulée"
+            safest = Recommendation(
+                bufferSizeResult: idleClean,
+                rationale: "Aucune taille testée ne reste propre sous toute la charge CPU simulée. Plus petite taille propre au repos : \(idleClean.grantedFrames) frames ; \(toleratedText). Prévois une taille au-dessus si la machine sera chargée." + pingNote(idleClean),
+                isFallback: true
+            )
+        } else if let fallback = fallbackByEventCount(trustworthy) {
             safest = Recommendation(
                 bufferSizeResult: fallback,
-                rationale: "Aucune taille de buffer testée n'est 100% propre sur toute la durée du test. Repli sur la taille avec le moins d'incidents au total (\(fallback.stability.totalIncidentCount)), puis le moins d'overloads (\(fallback.stability.overloadCount)), puis la latence la plus faible.",
+                rationale: "Aucune taille testée n'est entièrement propre. Repli sur la taille avec le moins d'événements (\(eventCount(fallback)) : incidents audio + overloads + arrêts d'E/S), puis la latence la plus faible." + pingNote(fallback),
                 isFallback: true
             )
         } else {
-            // Every single result had at least one channel that never locked — there's nothing
-            // verified to recommend from at all. Still return something (a fallback of last
-            // resort) rather than crashing the report, but say plainly that it's unconfirmed.
-            let fallback = fallbackByIncidentCount(sorted)!
+            let fallback = fallbackByEventCount(sorted)!
             safest = Recommendation(
                 bufferSizeResult: fallback,
-                rationale: "Aucun canal n'a pu être vérifié sur aucune taille de buffer testée (le verrouillage sur le signal de référence n'a jamais été acquis) — ce résultat n'est PAS confirmé, retenu seulement à défaut d'alternative. Vérifie le câblage/routage des canaux testés, ou que le signal de référence (ex: début du fichier WAV) contient assez de contenu pour être verrouillé.",
+                rationale: "Aucune passe n'a pu être entièrement vérifiée (canal jamais verrouillé sur son signal de référence, audio capturé perdu faute de temps d'analyse, ou passe interrompue) — ce résultat n'est PAS confirmé. Vérifie le câblage et le routage des canaux testés et relance.",
                 isFallback: true
             )
         }
 
-        let tolerable = verifiable.filter { result in
-            let minutes = max(result.stability.durationSeconds / 60.0, 1.0 / 60.0)
-            return result.stability.weightedIncidentRatePerMinute(minutes: minutes) <= sporadicTolerancePerMinute
-        }
+        let tolerable = trustworthy.filter { $0.stability.weightedIncidentRatePerMinute() <= sporadicTolerancePerMinute }
         let tradeoffCandidate = tolerable.min { $0.grantedFrames < $1.grantedFrames }
 
         let bestTradeoff: Recommendation
         var sameAsSafest = false
         if let candidate = tradeoffCandidate, candidate.grantedFrames < safest.bufferSizeResult.grantedFrames {
             let deltaMs = max(safest.bufferSizeResult.meanLatencyMs - candidate.meanLatencyMs, 0)
-            let incidents = candidate.stability.totalIncidentCount
-            let minutes = max(candidate.stability.durationSeconds / 60.0, 1.0 / 60.0)
-            let rate = candidate.stability.weightedIncidentRatePerMinute(minutes: minutes)
             let rationale = String(
-                format: "Taille %d : %.1f ms de latence en moins que la taille la plus sûre (%d), au prix de %d incident(s) sur %.0fs de test (taux pondéré %.2f/min, tolérance %.2f/min).",
-                candidate.grantedFrames, deltaMs, safest.bufferSizeResult.grantedFrames, incidents, candidate.stability.durationSeconds, rate, sporadicTolerancePerMinute
-            )
+                format: "Taille %d : %.1f ms de latence en moins que la plus sûre (%d), au prix de %d événement(s) sur %.0f s de test au repos (taux pondéré %.2f/min, tolérance %.2f/min).",
+                candidate.grantedFrames, deltaMs, safest.bufferSizeResult.grantedFrames, eventCount(candidate),
+                candidate.stability.durationSeconds, candidate.stability.weightedIncidentRatePerMinute(), sporadicTolerancePerMinute
+            ) + pingNote(candidate)
             bestTradeoff = Recommendation(bufferSizeResult: candidate, rationale: rationale, isFallback: false)
         } else {
             sameAsSafest = true
             bestTradeoff = Recommendation(
                 bufferSizeResult: safest.bufferSizeResult,
-                rationale: "Aucun compromis disponible sous la taille la plus sûre : c'est déjà la plus petite taille testée respectant la tolérance aux incidents sporadiques.",
+                rationale: "Aucun compromis disponible sous la taille la plus sûre : c'est déjà la plus petite taille testée qui respecte la tolérance aux incidents sporadiques.",
                 isFallback: safest.isFallback
             )
         }
@@ -81,11 +88,22 @@ public enum RecommendationEngine {
         return RecommendationSet(safest: safest, bestTradeoff: bestTradeoff, sameAsSafest: sameAsSafest)
     }
 
-    private static func fallbackByIncidentCount(_ candidates: [BufferSizeResult]) -> BufferSizeResult? {
+    private static func eventCount(_ result: BufferSizeResult) -> Int {
+        result.stability.totalIncidentCount + result.stability.overloadCount + result.stability.ioStoppedAbnormallyCount
+    }
+
+    private static func pingNote(_ result: BufferSizeResult) -> String {
+        guard result.hasUnreliablePings else { return "" }
+        return result.hasLatencyMeasurement
+            ? " Attention : la latence de certaines paires n'a pas pu être mesurée de façon fiable."
+            : " Attention : aucune latence n'a pu être mesurée pour cette taille."
+    }
+
+    private static func fallbackByEventCount(_ candidates: [BufferSizeResult]) -> BufferSizeResult? {
         candidates.min { a, b in
-            if a.stability.totalIncidentCount != b.stability.totalIncidentCount {
-                return a.stability.totalIncidentCount < b.stability.totalIncidentCount
-            }
+            let eventsA = eventCount(a)
+            let eventsB = eventCount(b)
+            if eventsA != eventsB { return eventsA < eventsB }
             if a.stability.overloadCount != b.stability.overloadCount {
                 return a.stability.overloadCount < b.stability.overloadCount
             }

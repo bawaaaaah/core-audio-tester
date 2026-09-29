@@ -5,10 +5,6 @@ import Foundation
 /// multi-channel output (e.g. captured on one channel, the detector's expected reference on
 /// another) lets both be compared sample-for-sample in any audio editor.
 public enum WAVWriter {
-    public static func writeFloat32Mono(samples: [Float], sampleRate: Double, to url: URL) throws {
-        try writeFloat32(interleavedSamples: samples, channelCount: 1, sampleRate: sampleRate, to: url)
-    }
-
     public static func writeFloat32(interleavedSamples samples: [Float], channelCount: Int, sampleRate: Double, to url: URL) throws {
         let numChannels = UInt16(channelCount)
         let bitsPerSample: UInt16 = 32
